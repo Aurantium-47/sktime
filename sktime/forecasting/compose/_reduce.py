@@ -2290,6 +2290,8 @@ class DirectReductionForecaster(_ReducerMixin, BaseForecaster):
 
     def _fit_multiple(self, y, X=None, fh=None):
         """Fit to training data."""
+        from copy import deepcopy
+
         from sktime.transformations.lag import Lag, ReducerTransform
 
         impute_method = self.impute_method
@@ -2313,6 +2315,15 @@ class DirectReductionForecaster(_ReducerMixin, BaseForecaster):
 
         self.estimators_ = []
 
+        # Without exogenous data, these deterministic reduction features do not
+        # depend on the horizon. Custom/stochastic transformers keep their
+        # independent per-horizon fitting and transformation behaviour.
+        self._reuse_reduction_features = (
+            X is None and self.transformers is None and impute_method == "bfill"
+        )
+        shared_features = None
+        shared_lagger = None
+
         for lag in y_lags:
             t = Lag(lags=lag, index_out="original", keep_column_names=True)
             lagger_y_to_y[lag] = t
@@ -2335,7 +2346,15 @@ class DirectReductionForecaster(_ReducerMixin, BaseForecaster):
                 impute_method=impute_method,
             )
 
-            Xtt = lagger_y_to_X[lag].fit_transform(X=y, y=X)
+            if self._reuse_reduction_features and shared_features is not None:
+                lagger_y_to_X[lag] = deepcopy(shared_lagger)
+                lagger_y_to_X[lag].shifted_vars_lag = X_lag
+                Xtt = shared_features.copy()
+            else:
+                Xtt = lagger_y_to_X[lag].fit_transform(X=y, y=X)
+                if self._reuse_reduction_features:
+                    shared_features = Xtt.copy()
+                    shared_lagger = lagger_y_to_X[lag]
             Xtt_notna_idx = _get_notna_idx(Xtt)
             yt_notna_idx = _get_notna_idx(yt)
             notna_idx = Xtt_notna_idx.intersection(yt_notna_idx)
@@ -2388,15 +2407,38 @@ class DirectReductionForecaster(_ReducerMixin, BaseForecaster):
         y_abs = list(fh_abs)
 
         y_pred_list = []
+        shared_features = None
 
         for i, lag in enumerate(y_lags):
             predict_idx = y_abs[i]
 
             lag_plus = Lag(lag, index_out="extend", keep_column_names=True)
 
-            Xt = lagger_y_to_X[-lag].transform(X=self._cur_y, y=X_pool)
-            Xtt = lag_plus.fit_transform(Xt)
-            Xtt_predrow = slice_at_ix(Xtt, predict_idx)
+            if self._reuse_reduction_features and shared_features is not None:
+                Xt = shared_features.copy()
+            else:
+                Xt = lagger_y_to_X[-lag].transform(X=self._cur_y, y=X_pool)
+                if self._reuse_reduction_features:
+                    shared_features = Xt.copy()
+            if self._reuse_reduction_features:
+                # Shifting the lagged features by h, then selecting cutoff + h,
+                # selects the same rows as selecting cutoff before the shift.
+                Xtt_predrow = slice_at_ix(Xt, self.cutoff).copy()
+                pred_index = Xtt_predrow.index
+                if isinstance(pred_index, pd.MultiIndex):
+                    arrays = [
+                        pred_index.get_level_values(i)
+                        for i in range(pred_index.nlevels - 1)
+                    ]
+                    arrays.append([predict_idx] * len(pred_index))
+                    Xtt_predrow.index = pd.MultiIndex.from_arrays(
+                        arrays, names=pred_index.names
+                    )
+                else:
+                    Xtt_predrow.index = pd.Index([predict_idx], name=pred_index.name)
+            else:
+                Xtt = lag_plus.fit_transform(Xt)
+                Xtt_predrow = slice_at_ix(Xtt, predict_idx)
             Xtt_predrow = prep_skl_df(Xtt_predrow)
 
             estimator = self.estimators_[i]
