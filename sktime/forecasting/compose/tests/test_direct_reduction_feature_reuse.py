@@ -81,3 +81,55 @@ def test_direct_reduction_keeps_prediction_feature_index(panel):
         **params, impute_method=Imputer(method="bfill")
     ).fit_predict(y, fh=[-3, 0, 2])
     pd.testing.assert_frame_equal(actual, expected)
+
+
+@pytest.mark.parametrize("hierarchical", [False, True])
+@pytest.mark.parametrize("period", [False, True])
+@pytest.mark.parametrize("update_params", [None, False, True])
+def test_direct_reduction_preserves_ragged_prediction_rows(
+    hierarchical, period, update_params
+):
+    """A shorter instance must retain its shifted, possibly missing feature row."""
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    index = (
+        pd.period_range("2020-01", periods=30, freq="M")
+        if period
+        else pd.RangeIndex(30)
+    )
+    y = pd.DataFrame({"y": np.arange(30.0)}, index=index)
+    y = pd.concat({"a": y, "b": y.iloc[:-2]}, names=["instance"])
+    if hierarchical:
+        y = pd.concat({"group1": y, "group2": y + 3}, names=["group"])
+    params = dict(
+        estimator=HistGradientBoostingRegressor(max_iter=2, random_state=0),
+        window_length=4,
+        pooling="global",
+    )
+    reference = DirectReductionForecaster(
+        **params, impute_method=Imputer(method="bfill")
+    ).fit(y, fh=[-3])
+    candidate = DirectReductionForecaster(**params).fit(y, fh=[-3])
+    if update_params is not None:
+        update = y.copy() + 0.25
+        arrays = [update.index.get_level_values(i) for i in range(update.index.nlevels)]
+        arrays[-1] = arrays[-1] + 1
+        update.index = pd.MultiIndex.from_arrays(arrays, names=y.index.names)
+        reference.update(update, update_params=update_params)
+        candidate.update(update, update_params=update_params)
+    expected = reference.predict()
+    actual = candidate.predict()
+    pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+    assert len(actual) == (4 if hierarchical else 2)
+    pd.testing.assert_frame_equal(candidate.predict(), expected, check_exact=True)
+
+
+def test_direct_reduction_predicts_without_reuse_attribute():
+    """Legacy fitted state without the optimization flag keeps the original path."""
+    y = pd.Series(np.arange(30.0))
+    forecaster = DirectReductionForecaster(Ridge(), window_length=4).fit(
+        y, fh=[-3, 0, 2]
+    )
+    expected = forecaster.predict()
+    del forecaster._reuse_reduction_features
+    pd.testing.assert_series_equal(forecaster.predict(), expected)

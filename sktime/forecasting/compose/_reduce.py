@@ -2408,34 +2408,27 @@ class DirectReductionForecaster(_ReducerMixin, BaseForecaster):
 
         y_pred_list = []
         shared_features = None
+        reuse_features = getattr(self, "_reuse_reduction_features", False)
 
         for i, lag in enumerate(y_lags):
             predict_idx = y_abs[i]
 
             lag_plus = Lag(lag, index_out="extend", keep_column_names=True)
 
-            if self._reuse_reduction_features and shared_features is not None:
+            if reuse_features and shared_features is not None:
                 Xt = shared_features.copy()
             else:
                 Xt = lagger_y_to_X[-lag].transform(X=self._cur_y, y=X_pool)
-                if self._reuse_reduction_features:
+                if reuse_features:
                     shared_features = Xt.copy()
-            if self._reuse_reduction_features:
+            # A panel can contain earlier-ending instances. Keep Lag's index
+            # extension/alignment for them, including rows with missing features.
+            if reuse_features and not isinstance(Xt.index, pd.MultiIndex):
                 # Shifting the lagged features by h, then selecting cutoff + h,
                 # selects the same rows as selecting cutoff before the shift.
                 Xtt_predrow = slice_at_ix(Xt, self.cutoff).copy()
                 pred_index = Xtt_predrow.index
-                if isinstance(pred_index, pd.MultiIndex):
-                    arrays = [
-                        pred_index.get_level_values(i)
-                        for i in range(pred_index.nlevels - 1)
-                    ]
-                    arrays.append([predict_idx] * len(pred_index))
-                    Xtt_predrow.index = pd.MultiIndex.from_arrays(
-                        arrays, names=pred_index.names
-                    )
-                else:
-                    Xtt_predrow.index = pd.Index([predict_idx], name=pred_index.name)
+                Xtt_predrow.index = pd.Index([predict_idx], name=pred_index.name)
             else:
                 Xtt = lag_plus.fit_transform(Xt)
                 Xtt_predrow = slice_at_ix(Xtt, predict_idx)
